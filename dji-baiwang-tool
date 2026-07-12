@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+DJI Baiwang QDC507 配置工具
+
+功能：
+- 自动扫描 AT 串口，并显示扫描进度
+- 查看模块状态
+- 按 IMEI 备份配置
+- 仅修改 USB VID/PID 为标准 Quectel 2C7C:0125
+- 按 IMEI 自动恢复原始 usbcfg / usbnet
+- 验证 USB、QMI、SIM、注册和信号状态
+- 批量处理多个模块
+
+依赖：
+    sudo apt install python3-serial libqmi-utils usbutils -y
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import serial
+
+
+PROGRAM_NAME = "dji-baiwang-tool"
+DEFAULT_BACKUP_DIR = Path("/var/lib/dji-baiwang-tool/backups")
+STANDARD_VID = 0x2C7C
+STANDARD_PID = 0x0125
+DJI_VID = 0x2CA3
+DJI_PID = 0x4006
+
+
+class ToolError(RuntimeError):
+    """用户可读错误。"""
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def run_command(
+    command: list[str],
+    timeout: float = 15,
+    check: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """执行外部命令并返回文本结果。"""
+    try:
+        return subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=check,
+        )
+    except FileNotFoundError as exc:
+        raise ToolError(f"缺少命令：{command[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ToolError(f"命令执行超时：{' '.join(command)}") from exc
+
+
+def clean_response(command: str, response: str) -> str:
+    """清理 AT 返回中的回显与空行。"""
+    lines: list[str] = []
+
+    for line in response.replace("\r", "\n").splitlines():
+        line = line.strip()
+        if not line or line == command:
+            continue
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def send_at(
+    port: serial.Serial,
+    command: str,
+    timeout: float = 2.5,
+) -> str:
+    """发送 AT 命令并等待 OK、ERROR 或超时。"""
+    port.reset_input_buffer()
+    port.reset_output_buffer()
+    port.write((command + "\r").encode("ascii"))
+    port.flush()
+
+    deadline = time.monotonic() + timeout
+    chunks: list[bytes] = []
+
+    while time.monotonic() < deadline:
+        waiting = port.in_waiting
+
+        if waiting:
+            chunks.append(port.read(waiting))
+            text = b"".join(chunks).decode("utf-8", errors="replace")
+
+            terminators = (
+                "\r\nOK\r\n",
+                "\nOK\n",
+                "\r\nERROR\r\n",
+                "\nERROR\n",
+                "+CME ERROR:",
+                "+CMS ERROR:",
+            )
+            if any(item in text for item in terminators):
+                break
+        else:
+            time.sleep(0.04)
+
+    raw = b"".join(chunks).decode("utf-8", errors="replace")
+    return clean_response(command, raw)
+
+
+def open_port(device: str) -> serial.Serial:
+    """打开串口。"""
+    return serial.Serial(
+        port=device,
+        baudrate=115200,
+        bytesize=serial.EIGHTBITS,
+        parity=serial.PARITY_NONE,
+        stopbits=serial.STOPBITS_ONE,
+        timeout=0.1,
+        write_timeout=2,
+        rtscts=False,
+        dsrdtr=False,
+        xonxoff=False,
+        exclusive=True,
+    )
+
+
+def list_candidate_ports() -> list[str]:
+    """列出可能的 AT 串口。优先测试常见的 ttyUSB2。"""
+    ports = sorted(glob.glob("/dev/ttyUSB*"))
+
+    def sort_key(path: str) -> tuple[int, str]:
+        name = os.path.basename(path)
+        if name == "ttyUSB2":
+            return (0, path)
+        if name == "ttyUSB3":
+            return (1, path)
+        if name == "ttyUSB1":
+            return (2, path)
+        return (3, path)
+
+    return sorted(ports, key=sort_key)
+
+
+def find_at_port(
+    specified_port: str | None = None,
+    quiet: bool = False,
+) -> tuple[str, serial.Serial]:
+    """自动寻找能返回 OK 的 AT 串口。"""
+    candidates = [specified_port] if specified_port else list_candidate_ports()
+
+    if not candidates:
+        raise ToolError("没有发现 /dev/ttyUSB*，请确认模块已连接并加载 option 驱动。")
+
+    errors: list[str] = []
+
+    for device in candidates:
+        if not device:
+            continue
+
+        if not quiet:
+            log(f"正在测试串口：{device}")
+
+        port: serial.Serial | None = None
+
+        try:
+            port = open_port(device)
+            time.sleep(0.12)
+
+            response = send_at(port, "AT", timeout=0.8)
+            if "OK" in response:
+                if not quiet:
+                    log(f"已找到 AT 串口：{device}")
+                return device, port
+
+            errors.append(f"{device}: 未返回 OK")
+
+        except serial.SerialException as exc:
+            errors.append(f"{device}: {exc}")
+
+        if port is not None and port.is_open:
+            try:
+                port.close()
+            except Exception:
+                pass
+
+    details = "\n".join(errors)
+    raise ToolError(
+        "未找到可用 AT 串口。可能被 ModemManager、picocom 或其他程序占用。\n"
+        f"{details}"
+    )
+
+
+def first_value(response: str) -> str:
+    for line in response.splitlines():
+        line = line.strip()
+        if line and line not in {"OK", "ERROR"}:
+            return line
+    return ""
+
+
+def get_imei(port: serial.Serial) -> str:
+    for command in ("AT+CGSN", "AT+GSN"):
+        response = send_at(port, command)
+        match = re.search(r"\b(\d{14,17})\b", response)
+        if match:
+            return match.group(1)
+
+    raise ToolError("无法通过 AT+CGSN 或 AT+GSN 读取 IMEI。")
+
+
+def parse_usbcfg(response: str) -> dict[str, int]:
+    match = re.search(
+        r'"usbcfg"\s*,\s*'
+        r'(0x[0-9A-Fa-f]+|\d+)\s*,\s*'
+        r'(0x[0-9A-Fa-f]+|\d+)\s*,\s*'
+        r'(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'
+        r'(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
+        response,
+    )
+
+    if not match:
+        raise ToolError(f"无法解析 usbcfg 返回：\n{response}")
+
+    values = list(match.groups())
+
+    return {
+        "vid": int(values[0], 0),
+        "pid": int(values[1], 0),
+        "diag": int(values[2]),
+        "nmea": int(values[3]),
+        "at_port": int(values[4]),
+        "modem": int(values[5]),
+        "rmnet": int(values[6]),
+        "adb": int(values[7]),
+        "uac": int(values[8]),
+    }
+
+
+def parse_usbnet(response: str) -> int:
+    match = re.search(r'"usbnet"\s*,\s*(\d+)', response)
+    if not match:
+        raise ToolError(f"无法解析 usbnet 返回：\n{response}")
+    return int(match.group(1))
+
+
+def parse_usbid(response: str) -> dict[str, int]:
+    match = re.search(
+        r'\+QCFG:\s*(?:"usbid"\s*,\s*)?'
+        r'(0x[0-9A-Fa-f]+|\d+)\s*,\s*'
+        r'(0x[0-9A-Fa-f]+|\d+)',
+        response,
+    )
+
+    if not match:
+        raise ToolError(f"无法解析 usbid 返回：\n{response}")
+
+    return {
+        "vid": int(match.group(1), 0),
+        "pid": int(match.group(2), 0),
+    }
+
+
+def collect_info(port: serial.Serial, device: str) -> dict[str, Any]:
+    log("正在读取模块信息……")
+
+    ati_raw = send_at(port, "ATI", timeout=3)
+    firmware_raw = send_at(port, "AT+CGMR", timeout=3)
+    usbcfg_raw = send_at(port, 'AT+QCFG="usbcfg"', timeout=3)
+    usbnet_raw = send_at(port, 'AT+QCFG="usbnet"', timeout=3)
+    usbid_raw = send_at(port, 'AT+QCFG="usbid"', timeout=3)
+
+    imei = get_imei(port)
+    usbcfg = parse_usbcfg(usbcfg_raw)
+    usbnet = parse_usbnet(usbnet_raw)
+    usbid = parse_usbid(usbid_raw)
+
+    return {
+        "backup_version": 2,
+        "backup_time": datetime.now().astimezone().isoformat(),
+        "at_port": device,
+        "imei": imei,
+        "ati": ati_raw,
+        "firmware": first_value(firmware_raw),
+        "firmware_raw": firmware_raw,
+        "usbcfg": usbcfg,
+        "usbnet": usbnet,
+        "usbid": usbid,
+        "raw": {
+            "ATI": ati_raw,
+            "AT+CGMR": firmware_raw,
+            'AT+QCFG="usbcfg"': usbcfg_raw,
+            'AT+QCFG="usbnet"': usbnet_raw,
+            'AT+QCFG="usbid"': usbid_raw,
+        },
+    }
+
+
+def safe_name(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+    return value.strip("-") or "unknown"
+
+
+def save_backup(info: dict[str, Any], backup_dir: Path) -> Path:
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    imei = safe_name(str(info["imei"]))
+    firmware = safe_name(str(info.get("firmware", "unknown")))
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    path = backup_dir / f"{imei}-{firmware}-{timestamp}.json"
+
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(info, file, ensure_ascii=False, indent=2)
+
+    latest_path = backup_dir / f"{imei}-latest.json"
+
+    try:
+        if latest_path.exists() or latest_path.is_symlink():
+            latest_path.unlink()
+        latest_path.symlink_to(path.name)
+    except OSError:
+        shutil.copy2(path, latest_path)
+
+    return path
+
+
+def format_usbcfg_command(config: dict[str, int]) -> str:
+    return (
+        'AT+QCFG="usbcfg",'
+        f'0x{config["vid"]:04X},'
+        f'0x{config["pid"]:04X},'
+        f'{config["diag"]},'
+        f'{config["nmea"]},'
+        f'{config["at_port"]},'
+        f'{config["modem"]},'
+        f'{config["rmnet"]},'
+        f'{config["adb"]},'
+        f'{config["uac"]}'
+    )
+
+
+def print_info(info: dict[str, Any]) -> None:
+    cfg = info["usbcfg"]
+    usbid = info["usbid"]
+
+    print(f"AT 端口：{info['at_port']}")
+    print(f"IMEI：{info['imei']}")
+    print(f"固件：{info['firmware']}")
+    print(f"USBID：{usbid['vid']:04X}:{usbid['pid']:04X}")
+    print(
+        "USBCFG："
+        f"{cfg['vid']:04X}:{cfg['pid']:04X},"
+        f" diag={cfg['diag']},"
+        f" nmea={cfg['nmea']},"
+        f" at={cfg['at_port']},"
+        f" modem={cfg['modem']},"
+        f" rmnet={cfg['rmnet']},"
+        f" adb={cfg['adb']},"
+        f" uac={cfg['uac']}"
+    )
+    print(f"USBNET：{info['usbnet']}")
+
+
+def require_yes(args: argparse.Namespace, warning: str) -> None:
+    if not getattr(args, "yes", False):
+        print(warning, file=sys.stderr)
+        print("确认无误后，请在命令末尾添加 --yes。", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def restart_module(port: serial.Serial) -> None:
+    log("正在重启模块……")
+    try:
+        response = send_at(port, "AT+CFUN=1,1", timeout=1)
+        if response:
+            print(response)
+    except Exception:
+        pass
+    print("模块正在重新枚举，串口断开属于正常现象。")
+
+
+def find_backup_for_imei(backup_dir: Path, imei: str) -> Path:
+    latest = backup_dir / f"{imei}-latest.json"
+
+    if latest.exists():
+        return latest.resolve()
+
+    candidates = sorted(
+        backup_dir.glob(f"{imei}-*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    if not candidates:
+        raise ToolError(
+            f"没有找到 IMEI {imei} 的备份。\n"
+            f"备份目录：{backup_dir}"
+        )
+
+    return candidates[0]
+
+
+def load_backup(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise ToolError(f"备份文件不存在：{path}")
+
+    with path.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def find_qmi_device() -> str | None:
+    devices = sorted(glob.glob("/dev/cdc-wdm*"))
+    return devices[0] if devices else None
+
+
+def find_wwan_interfaces() -> list[str]:
+    result: list[str] = []
+
+    for path in glob.glob("/sys/class/net/*"):
+        name = os.path.basename(path)
+        if name.startswith(("wwan", "wwp", "wwx")):
+            result.append(name)
+
+    return sorted(result)
+
+
+def qmicli(args: list[str], timeout: float = 12) -> tuple[bool, str]:
+    device = find_qmi_device()
+    if not device:
+        return False, "未找到 /dev/cdc-wdm*"
+
+    command = ["qmicli", "-d", device, "--device-open-proxy", *args]
+    result = run_command(command, timeout=timeout)
+
+    output = "\n".join(
+        part.strip()
+        for part in (result.stdout, result.stderr)
+        if part.strip()
+    )
+
+    return result.returncode == 0, output
+
+
+def parse_lsusb_id() -> tuple[str, str] | None:
+    result = run_command(["lsusb"], timeout=5)
+
+    for line in result.stdout.splitlines():
+        match = re.search(r"ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})", line)
+        if not match:
+            continue
+
+        vid, pid = match.group(1).lower(), match.group(2).lower()
+
+        if (vid, pid) in {
+            ("2ca3", "4006"),
+            ("2c7c", "0125"),
+        }:
+            return vid, pid
+
+    return None
+
+
+def check_driver_layout() -> tuple[bool, str]:
+    result = run_command(["lsusb", "-t"], timeout=5)
+    text = result.stdout
+
+    option_count = len(re.findall(r"Driver=option", text))
+    qmi_count = len(re.findall(r"Driver=qmi_wwan", text))
+
+    ok = option_count >= 4 and qmi_count >= 1
+    return ok, f"option={option_count}, qmi_wwan={qmi_count}"
+
+
+def command_status(args: argparse.Namespace) -> None:
+    device, port = find_at_port(args.port)
+
+    try:
+        info = collect_info(port, device)
+        print_info(info)
+    finally:
+        port.close()
+
+
+def command_backup(args: argparse.Namespace) -> None:
+    device, port = find_at_port(args.port)
+
+    try:
+        info = collect_info(port, device)
+        path = save_backup(info, Path(args.backup_dir).expanduser())
+
+        print_info(info)
+        print()
+        print(f"备份已保存：{path}")
+        print("完整恢复命令：")
+        print(format_usbcfg_command(info["usbcfg"]))
+        print(f'AT+QCFG="usbnet",{info["usbnet"]}')
+    finally:
+        port.close()
+
+
+def command_convert(args: argparse.Namespace) -> None:
+    require_yes(args, "该操作会把模块 VID/PID 持久化修改为 2C7C:0125。")
+
+    device, port = find_at_port(args.port)
+
+    try:
+        info = collect_info(port, device)
+        backup_path = save_backup(
+            info,
+            Path(args.backup_dir).expanduser(),
+        )
+
+        print(f"当前模块 IMEI：{info['imei']}")
+        print(f"原始备份：{backup_path}")
+        print(
+            "原始 USBID："
+            f"{info['usbid']['vid']:04X}:{info['usbid']['pid']:04X}"
+        )
+
+        if (
+            info["usbid"]["vid"] == STANDARD_VID
+            and info["usbid"]["pid"] == STANDARD_PID
+        ):
+            print("当前已经是 2C7C:0125，无需重复写入。")
+            return
+
+        # 只改 VID/PID，不覆盖已验证可用的 USB 功能布局。
+        command = f'AT+QCFG="usbid",{STANDARD_VID},{STANDARD_PID}'
+        print(f"执行：{command}")
+
+        response = send_at(port, command, timeout=3)
+        print(response)
+
+        if "OK" not in response:
+            raise ToolError("写入标准 VID/PID 失败，模块没有返回 OK。")
+
+        verify = send_at(port, 'AT+QCFG="usbid"', timeout=3)
+        print("写入后查询：")
+        print(verify)
+
+        parsed = parse_usbid(verify)
+
+        if parsed["vid"] != STANDARD_VID or parsed["pid"] != STANDARD_PID:
+            raise ToolError(
+                "写入后校验失败："
+                f"{parsed['vid']:04X}:{parsed['pid']:04X}"
+            )
+
+        print("VID/PID 已持久化写入为 2C7C:0125。")
+
+        if args.restart:
+            restart_module(port)
+        else:
+            print("请断电重新拔插模块，或添加 --restart 自动重启。")
+
+    finally:
+        try:
+            port.close()
+        except Exception:
+            pass
+
+
+def command_restore(args: argparse.Namespace) -> None:
+    require_yes(args, "该操作会恢复备份中的原始 USB 配置。")
+
+    device, port = find_at_port(args.port)
+
+    try:
+        current_imei = get_imei(port)
+        backup_dir = Path(args.backup_dir).expanduser()
+
+        if args.file:
+            backup_path = Path(args.file).expanduser().resolve()
+        else:
+            backup_path = find_backup_for_imei(backup_dir, current_imei)
+
+        backup = load_backup(backup_path)
+        backup_imei = str(backup.get("imei", ""))
+
+        if backup_imei != current_imei and not args.force:
+            raise ToolError(
+                "备份 IMEI 与当前模块不一致，已拒绝恢复。\n"
+                f"当前模块：{current_imei}\n"
+                f"备份模块：{backup_imei}\n"
+                "确需跨模块恢复时添加 --force。"
+            )
+
+        print(f"当前模块 IMEI：{current_imei}")
+        print(f"使用备份：{backup_path}")
+
+        usbnet_command = f'AT+QCFG="usbnet",{backup["usbnet"]}'
+        usbcfg_command = format_usbcfg_command(backup["usbcfg"])
+
+        print(f"执行：{usbnet_command}")
+        response = send_at(port, usbnet_command, timeout=3)
+        print(response)
+
+        if "OK" not in response:
+            raise ToolError("恢复 usbnet 失败。")
+
+        # usbcfg 最后执行，因为可能触发 USB 重新枚举。
+        print(f"执行：{usbcfg_command}")
+        response = send_at(port, usbcfg_command, timeout=3)
+        print(response)
+
+        if response and "OK" not in response:
+            raise ToolError("恢复 usbcfg 失败。")
+
+        print("原始 USB 配置已经写入。")
+
+        if args.restart:
+            restart_module(port)
+        else:
+            print("请断电重新拔插模块，使恢复配置完全生效。")
+
+    finally:
+        try:
+            port.close()
+        except Exception:
+            pass
+
+
+def command_verify(args: argparse.Namespace) -> None:
+    print("开始验证模块状态：")
+
+    failures = 0
+
+    usb_id = parse_lsusb_id()
+    if usb_id:
+        vid, pid = usb_id
+        standard = (vid, pid) == ("2c7c", "0125")
+        mark = "✓" if standard else "!"
+        print(f"{mark} USB ID       {vid.upper()}:{pid.upper()}")
+        if args.require_standard and not standard:
+            failures += 1
+    else:
+        print("✗ USB ID       未发现目标模块")
+        failures += 1
+
+    layout_ok, layout_text = check_driver_layout()
+    print(f"{'✓' if layout_ok else '✗'} 驱动布局     {layout_text}")
+    if not layout_ok:
+        failures += 1
+
+    tty_ports = sorted(glob.glob("/dev/ttyUSB*"))
+    tty_ok = len(tty_ports) >= 4
+    print(
+        f"{'✓' if tty_ok else '✗'} AT/串口      "
+        f"{len(tty_ports)} 个：{', '.join(tty_ports) if tty_ports else '无'}"
+    )
+    if not tty_ok:
+        failures += 1
+
+    qmi_device = find_qmi_device()
+    print(f"{'✓' if qmi_device else '✗'} QMI 设备     {qmi_device or '未发现'}")
+    if not qmi_device:
+        failures += 1
+
+    interfaces = find_wwan_interfaces()
+    print(
+        f"{'✓' if interfaces else '✗'} 网络接口     "
+        f"{', '.join(interfaces) if interfaces else '未发现'}"
+    )
+    if not interfaces:
+        failures += 1
+
+    if qmi_device and shutil.which("qmicli"):
+        ok, output = qmicli(["--get-service-version-info"])
+        print(f"{'✓' if ok else '✗'} QMI 通信     {'正常' if ok else '失败'}")
+        if not ok:
+            print(output)
+            failures += 1
+
+        ok, output = qmicli(["--dms-get-revision"])
+        revision_match = re.search(r"Revision:\s*'([^']+)'", output)
+        revision = revision_match.group(1) if revision_match else "未知"
+        print(f"{'✓' if ok else '✗'} 固件版本     {revision}")
+        if not ok:
+            failures += 1
+
+        ok, output = qmicli(["--uim-get-card-status"])
+        if ok:
+            if "Card state: 'present'" in output:
+                sim_status = "已插卡并识别"
+            elif "no-atr-received" in output:
+                sim_status = "未插卡或未收到 ATR"
+            else:
+                sim_status = "已响应，状态需查看详细输出"
+
+            print(f"✓ SIM 状态     {sim_status}")
+
+            if args.verbose:
+                print(output)
+        else:
+            print("✗ SIM 状态     查询失败")
+            print(output)
+            failures += 1
+
+        ok, output = qmicli(["--nas-get-serving-system"])
+        if ok:
+            registration = (
+                "已注册"
+                if "Registration state: 'registered'" in output
+                else "未注册"
+            )
+            radio_match = re.search(r"\[0\]:\s*'([^']+)'", output)
+            radio = radio_match.group(1) if radio_match else "未知制式"
+            print(f"✓ 网络注册     {registration}，{radio}")
+            if args.verbose:
+                print(output)
+        else:
+            print("! 网络注册     查询失败或无服务")
+            if args.verbose:
+                print(output)
+
+        ok, output = qmicli(["--nas-get-signal-strength"])
+        if ok:
+            current_match = re.search(
+                r"Network '([^']+)':\s*'([^']+)'",
+                output,
+            )
+            if current_match:
+                print(
+                    "✓ 信号强度     "
+                    f"{current_match.group(1)} {current_match.group(2)}"
+                )
+            else:
+                print("✓ 信号强度     已读取")
+            if args.verbose:
+                print(output)
+        else:
+            print("! 信号强度     暂时无法读取")
+            if args.verbose:
+                print(output)
+    elif qmi_device:
+        print("! QMI 检查     未安装 qmicli，请安装 libqmi-utils")
+
+    if failures:
+        raise ToolError(f"验证完成，共发现 {failures} 个关键问题。")
+
+    print("验证完成：关键项目正常。")
+
+
+def wait_for_module_removal(timeout: int = 120) -> bool:
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        if not parse_lsusb_id():
+            return True
+        time.sleep(0.5)
+
+    return False
+
+
+def wait_for_module_insert(timeout: int = 0) -> bool:
+    """timeout=0 表示一直等待，Ctrl+C 可退出。"""
+    start = time.monotonic()
+
+    while True:
+        if parse_lsusb_id():
+            return True
+
+        if timeout and time.monotonic() - start >= timeout:
+            return False
+
+        time.sleep(0.5)
+
+
+def command_batch(args: argparse.Namespace) -> None:
+    require_yes(args, "批量模式会对每块插入的模块执行备份并转换为 2C7C:0125。")
+
+    backup_dir = Path(args.backup_dir).expanduser()
+    processed: set[str] = set()
+
+    print("批量模式已启动。")
+    print("每次只连接一块模块；按 Ctrl+C 结束。")
+
+    while True:
+        print()
+        print("请插入下一块模块……")
+
+        if not wait_for_module_insert(timeout=args.wait_timeout):
+            raise ToolError("等待模块插入超时。")
+
+        time.sleep(1.5)
+
+        device: str | None = None
+        port: serial.Serial | None = None
+
+        try:
+            device, port = find_at_port(args.port)
+            info = collect_info(port, device)
+            imei = str(info["imei"])
+
+            if imei in processed:
+                print(f"模块 {imei} 已处理过，本次跳过。")
+            else:
+                backup_path = save_backup(info, backup_dir)
+                print(f"IMEI：{imei}")
+                print(f"备份：{backup_path}")
+
+                current_vid = info["usbid"]["vid"]
+                current_pid = info["usbid"]["pid"]
+
+                if current_vid == STANDARD_VID and current_pid == STANDARD_PID:
+                    print("当前已经是 2C7C:0125，无需转换。")
+                else:
+                    command = f'AT+QCFG="usbid",{STANDARD_VID},{STANDARD_PID}'
+                    print(f"执行：{command}")
+                    response = send_at(port, command, timeout=3)
+                    print(response)
+
+                    if "OK" not in response:
+                        raise ToolError("VID/PID 写入失败。")
+
+                    verify = parse_usbid(
+                        send_at(port, 'AT+QCFG="usbid"', timeout=3)
+                    )
+
+                    if (
+                        verify["vid"] != STANDARD_VID
+                        or verify["pid"] != STANDARD_PID
+                    ):
+                        raise ToolError("写入后的 VID/PID 校验失败。")
+
+                    print("转换成功。")
+
+                processed.add(imei)
+
+                if args.restart:
+                    restart_module(port)
+                else:
+                    print("请拔出当前模块。")
+
+        finally:
+            if port is not None:
+                try:
+                    port.close()
+                except Exception:
+                    pass
+
+        if not wait_for_module_removal(timeout=args.remove_timeout):
+            print("等待拔出模块超时，请手动拔出后继续。")
+            while parse_lsusb_id():
+                time.sleep(0.5)
+
+        print(f"已处理模块数量：{len(processed)}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="DJI Baiwang QDC507 备份、固化、恢复和验证工具"
+    )
+
+    parser.add_argument(
+        "--port",
+        help="指定 AT 串口，例如 /dev/ttyUSB2；默认自动扫描",
+    )
+    parser.add_argument(
+        "--backup-dir",
+        default=str(DEFAULT_BACKUP_DIR),
+        help=f"备份目录，默认：{DEFAULT_BACKUP_DIR}",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    status_parser = subparsers.add_parser("status", help="查看当前模块配置")
+    status_parser.set_defaults(func=command_status)
+
+    backup_parser = subparsers.add_parser("backup", help="按 IMEI 备份当前模块")
+    backup_parser.set_defaults(func=command_backup)
+
+    convert_parser = subparsers.add_parser(
+        "convert",
+        help="备份后仅修改 VID/PID 为 2C7C:0125",
+    )
+    convert_parser.add_argument("--yes", action="store_true", help="确认执行写入")
+    convert_parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="写入后执行 AT+CFUN=1,1",
+    )
+    convert_parser.set_defaults(func=command_convert)
+
+    restore_parser = subparsers.add_parser(
+        "restore",
+        help="按当前 IMEI 自动寻找备份并恢复",
+    )
+    restore_parser.add_argument("--file", help="手动指定备份 JSON 文件")
+    restore_parser.add_argument("--yes", action="store_true", help="确认执行恢复")
+    restore_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="允许使用其他 IMEI 的备份，谨慎使用",
+    )
+    restore_parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="恢复后执行 AT+CFUN=1,1",
+    )
+    restore_parser.set_defaults(func=command_restore)
+
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="验证 USB、QMI、SIM、网络注册和信号",
+    )
+    verify_parser.add_argument(
+        "--require-standard",
+        action="store_true",
+        help="要求 USB ID 必须为 2C7C:0125",
+    )
+    verify_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="显示完整 qmicli 返回",
+    )
+    verify_parser.set_defaults(func=command_verify)
+
+    batch_parser = subparsers.add_parser(
+        "batch",
+        help="连续备份并转换多块模块",
+    )
+    batch_parser.add_argument("--yes", action="store_true", help="确认进入批量模式")
+    batch_parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="每块写入后执行 AT+CFUN=1,1",
+    )
+    batch_parser.add_argument(
+        "--wait-timeout",
+        type=int,
+        default=0,
+        help="等待模块插入秒数，0 表示一直等待",
+    )
+    batch_parser.add_argument(
+        "--remove-timeout",
+        type=int,
+        default=120,
+        help="等待模块拔出秒数，默认 120",
+    )
+    batch_parser.set_defaults(func=command_batch)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        args.func(args)
+        return 0
+
+    except PermissionError:
+        print(
+            "权限不足。请使用 sudo 运行，或把用户加入 dialout 组。",
+            file=sys.stderr,
+        )
+        return 1
+
+    except serial.SerialException as exc:
+        print(f"串口错误：{exc}", file=sys.stderr)
+        return 1
+
+    except ToolError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+
+    except KeyboardInterrupt:
+        print("\n操作已取消。", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
