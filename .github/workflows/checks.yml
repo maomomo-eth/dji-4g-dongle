@@ -31,3 +31,6 @@ jobs:
         run: |
           python3 dji-baiwang-tool --help
           python3 dji-qmi-network --help
+
+      - name: 运行单元测试
+        run: python3 -m unittest discover -s tests -v

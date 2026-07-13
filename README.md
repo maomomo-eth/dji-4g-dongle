@@ -76,6 +76,8 @@ sudo dji-qmi-network connect --apn ctnet
 
 需要写入模块或修改网络的命令应使用 `sudo`。
 
+`connect --force` 不会忽略或覆盖旧状态：工具会先使用旧 CID/PDH 停止会话并清理 IP、路由和 DNS，再建立新连接。状态文件损坏时会拒绝继续。
+
 ## 架构图
 
 ```text
@@ -105,4 +107,3 @@ option + qmi_wwan
 - 写入配置过程中不要断电或拔出模块。
 - 恢复时必须使用正确 IMEI 对应的备份；`--force` 跨 IMEI 恢复风险较高。
 - 本项目不保证适配所有 QDC507 固件、模块批次和运营商环境。
-

@@ -256,3 +256,41 @@ sudo ip link set <接口> up
 ```
 
 如果控制节点不存在，该接口可能不是 `qmi_wwan` 接口，应回到第 1 节检查驱动绑定。
+
+## 15. 状态文件损坏
+
+错误示例：
+
+```text
+错误：联网状态文件损坏：/run/dji-qmi-network.json
+```
+
+工具不会用 `--force` 覆盖损坏的状态文件。先手工确认接口和 QMI 分组数据状态：
+
+```bash
+ip -4 addr
+ip route
+sudo qmicli -d /dev/cdc-wdm0 --wds-get-packet-service-status
+```
+
+QMI 设备名应替换为本机实际值。如果确认没有需要保留或手工停止的会话，再删除损坏状态：
+
+```bash
+sudo rm -f /run/dji-qmi-network.json
+```
+
+不要在未确认会话状态时直接删除，否则可能失去停止旧 CID/PDH 的信息。
+
+## 16. 连通性测试失败
+
+新版工具在拨号后的接口配置或公网连通性测试失败时会自动停止本次 WDS 会话，并清理 IPv4、默认路由、网关路由、DNS 和状态文件。命令仍返回失败，并显示已自动回滚。
+
+失败后可检查是否仍有本工具创建的默认路由：
+
+```bash
+ip -4 addr
+ip route
+test ! -e /run/dji-qmi-network.json && echo "状态文件已清理"
+```
+
+若仍有残留，请保留完整警告输出，并按第 10 节手工核对和清理。

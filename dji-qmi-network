@@ -272,7 +272,122 @@ def save_state(state: dict[str, Any]) -> None:
 def load_state() -> dict[str, Any]:
     if not STATE_FILE.exists():
         raise ToolError(f"没有找到联网状态文件：{STATE_FILE}")
-    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ToolError(f"联网状态文件损坏：{STATE_FILE}") from exc
+
+    if not isinstance(state, dict):
+        raise ToolError(f"联网状态文件损坏：{STATE_FILE}")
+
+    required = ("device", "interface", "cid", "pdh")
+    missing = [key for key in required if key not in state]
+    if missing:
+        raise ToolError(f"联网状态文件缺少字段：{', '.join(missing)}")
+
+    try:
+        state["device"] = str(state["device"])
+        state["interface"] = str(state["interface"])
+        state["cid"] = int(state["cid"])
+        state["pdh"] = int(state["pdh"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ToolError(f"联网状态文件字段格式错误：{STATE_FILE}") from exc
+    return state
+
+
+def cleanup_connection(
+    state: dict[str, Any],
+    *,
+    restore_modemmanager: bool,
+    remove_state_file: bool = True,
+    quiet: bool = False,
+) -> None:
+    """尽最大努力停止会话，并清理本工具创建的网络配置。"""
+    device = str(state["device"])
+    interface = str(state["interface"])
+    cid = int(state["cid"])
+    pdh = int(state["pdh"])
+    settings = state.get("settings", {})
+    gateway = settings.get("gateway") if isinstance(settings, dict) else None
+    metric = state.get("metric", DEFAULT_METRIC)
+
+    try:
+        qmicli(
+            device,
+            [
+                f"--client-cid={cid}",
+                "--client-no-release-cid",
+                f"--wds-stop-network={pdh}",
+            ],
+        )
+        if not quiet:
+            log("QMI 数据连接已断开。")
+    except Exception as exc:
+        log(f"警告：停止 QMI 会话失败：{exc}")
+
+    cleanup_commands: list[tuple[str, list[str]]] = []
+    if gateway:
+        cleanup_commands.extend(
+            [
+                (
+                    "删除默认路由",
+                    [
+                        "ip", "route", "del", "default", "via", str(gateway),
+                        "dev", interface, "metric", str(metric),
+                    ],
+                ),
+                (
+                    "删除网关路由",
+                    ["ip", "route", "del", str(gateway), "dev", interface],
+                ),
+            ]
+        )
+    cleanup_commands.append(
+        (
+            "清理接口 IPv4",
+            ["ip", "addr", "flush", "dev", interface, "scope", "global"],
+        )
+    )
+
+    for action, command in cleanup_commands:
+        try:
+            result = run_command(command, timeout=5)
+            if result.returncode != 0:
+                detail = command_output(result) or f"退出码 {result.returncode}"
+                log(f"警告：{action}失败：{detail}")
+        except Exception as exc:
+            log(f"警告：{action}失败：{exc}")
+
+    if state.get("dns_configured"):
+        if shutil.which("resolvectl"):
+            try:
+                result = run_command(["resolvectl", "revert", interface], timeout=5)
+                if result.returncode != 0:
+                    detail = command_output(result) or f"退出码 {result.returncode}"
+                    log(f"警告：恢复链路 DNS 失败：{detail}")
+            except Exception as exc:
+                log(f"警告：恢复链路 DNS 失败：{exc}")
+        elif not quiet:
+            log("警告：未找到 resolvectl，无法恢复链路 DNS。")
+
+    if remove_state_file:
+        try:
+            STATE_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log(f"警告：删除联网状态文件失败：{exc}")
+
+    if state.get("modemmanager_stopped") and restore_modemmanager:
+        if not quiet:
+            log("正在恢复 ModemManager……")
+        try:
+            start_modemmanager()
+        except Exception as exc:
+            log(f"警告：恢复 ModemManager 失败：{exc}")
+
+    if not quiet:
+        print("网络配置已清理。")
 
 
 def test_connection(interface: str) -> tuple[bool, str | None]:
@@ -296,6 +411,7 @@ def test_connection(interface: str) -> tuple[bool, str | None]:
 
 def command_doctor(args: argparse.Namespace) -> None:
     failures = 0
+    network_ready = False
     for command in ("qmicli", "ip"):
         present = shutil.which(command) is not None
         print(
@@ -349,6 +465,7 @@ def command_doctor(args: argparse.Namespace) -> None:
             serving = qmicli(device, ["--nas-get-serving-system"])
             registered = "Registration state: 'registered'" in serving
             attached = "PS: 'attached'" in serving
+            network_ready = registered and attached
             print(
                 f"{'✓' if registered and attached else '!'} LTE 网络       "
                 f"registered={registered}, attached={attached}"
@@ -364,6 +481,9 @@ def command_doctor(args: argparse.Namespace) -> None:
 
     if failures:
         raise ToolError(f"诊断完成，发现 {failures} 个关键问题。")
+    if not network_ready:
+        print("诊断完成：基础硬件正常，但当前尚未完成移动网络注册或数据附着。")
+        return
     print("诊断完成：关键项目正常。")
 
 
@@ -372,14 +492,22 @@ def command_connect(args: argparse.Namespace) -> None:
     require_command("qmicli")
     require_command("ip")
 
-    if STATE_FILE.exists() and not args.force:
-        raise ToolError("检测到已有联网状态。请先 disconnect，或添加 --force 覆盖。")
+    if STATE_FILE.exists():
+        if not args.force:
+            raise ToolError(
+                "检测到已有联网状态。请先执行 disconnect，"
+                "或使用 --force 先清理旧连接后重新联网。"
+            )
+        old_state = load_state()
+        log("检测到已有连接状态，正在先清理旧会话……")
+        cleanup_connection(old_state, restore_modemmanager=True)
 
     device = find_qmi_device(args.device)
     interface = find_interface(device, args.interface)
     mm_stopped = False
     cid: int | None = None
     pdh: int | None = None
+    state: dict[str, Any] | None = None
 
     try:
         if modemmanager_active():
@@ -407,6 +535,17 @@ def command_connect(args: argparse.Namespace) -> None:
             timeout=45,
         )
         cid, pdh = parse_network_started(started)
+        state = {
+            "device": device,
+            "interface": interface,
+            "apn": args.apn,
+            "cid": cid,
+            "pdh": pdh,
+            "metric": args.metric,
+            "settings": {},
+            "dns_configured": False,
+            "modemmanager_stopped": mm_stopped,
+        }
 
         settings_output = qmicli(
             device,
@@ -417,20 +556,12 @@ def command_connect(args: argparse.Namespace) -> None:
             ],
         )
         settings = parse_settings(settings_output)
+        state["settings"] = settings
         configure_interface(interface, settings, args.metric)
-        dns_configured = configure_dns(interface, settings["dns"])
-
-        state = {
-            "device": device,
-            "interface": interface,
-            "apn": args.apn,
-            "cid": cid,
-            "pdh": pdh,
-            "metric": args.metric,
-            "settings": settings,
-            "dns_configured": dns_configured,
-            "modemmanager_stopped": mm_stopped,
-        }
+        state["dns_configured"] = bool(
+            settings["dns"] and shutil.which("resolvectl")
+        )
+        configure_dns(interface, settings["dns"])
         save_state(state)
 
         ok, public_ip = (
@@ -452,22 +583,15 @@ def command_connect(args: argparse.Namespace) -> None:
         if public_ip:
             print(f"  公网出口：  {public_ip}")
         if not ok:
-            raise ToolError("拨号和地址配置已完成，但公网连通性测试失败。")
+            raise ToolError(
+                "拨号和网络参数配置已完成，但公网连通性测试失败，"
+                "已自动回滚本次连接。"
+            )
 
     except Exception:
-        if cid is not None and pdh is not None:
-            try:
-                qmicli(
-                    device,
-                    [
-                        f"--client-cid={cid}",
-                        "--client-no-release-cid",
-                        f"--wds-stop-network={pdh}",
-                    ],
-                )
-            except Exception:
-                pass
-        if mm_stopped:
+        if state is not None:
+            cleanup_connection(state, restore_modemmanager=True, quiet=True)
+        elif mm_stopped:
             start_modemmanager()
         raise
 
@@ -477,62 +601,16 @@ def command_disconnect(args: argparse.Namespace) -> None:
     require_command("qmicli")
     require_command("ip")
     state = load_state()
-
-    device = str(state["device"])
-    interface = str(state["interface"])
-    cid = int(state["cid"])
-    pdh = int(state["pdh"])
-    settings = state.get("settings", {})
-
-    try:
-        qmicli(
-            device,
-            [
-                f"--client-cid={cid}",
-                "--client-no-release-cid",
-                f"--wds-stop-network={pdh}",
-            ],
-        )
-        log("QMI 数据连接已断开。")
-    except ToolError as exc:
-        log(f"警告：停止 QMI 会话失败：{exc}")
-
-    gateway = settings.get("gateway")
-    metric = state.get("metric", DEFAULT_METRIC)
-    if gateway:
-        run_command(
-            [
-                "ip", "route", "del", "default", "via", str(gateway),
-                "dev", interface, "metric", str(metric),
-            ],
-            timeout=5,
-        )
-        run_command(
-            ["ip", "route", "del", str(gateway), "dev", interface], timeout=5
-        )
-    run_command(
-        ["ip", "addr", "flush", "dev", interface, "scope", "global"], timeout=5
+    cleanup_connection(
+        state,
+        restore_modemmanager=not args.no_restore_modemmanager,
     )
-
-    if state.get("dns_configured") and shutil.which("resolvectl"):
-        run_command(["resolvectl", "revert", interface], timeout=5)
-
-    try:
-        STATE_FILE.unlink()
-    except FileNotFoundError:
-        pass
-
-    if state.get("modemmanager_stopped") and not args.no_restore_modemmanager:
-        log("正在恢复 ModemManager……")
-        start_modemmanager()
-
-    print("网络配置已清理。")
 
 
 def command_status(args: argparse.Namespace) -> None:
     state: dict[str, Any] | None = None
     if STATE_FILE.exists():
-        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        state = load_state()
 
     device = find_qmi_device(args.device)
     interface = find_interface(device, args.interface)
@@ -598,7 +676,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-test", action="store_true", help="跳过 ping 和公网 IP 测试"
     )
     connect.add_argument(
-        "--force", action="store_true", help="忽略已有状态文件并重新连接"
+        "--force", action="store_true", help="先清理已有连接状态并重新连接"
     )
     connect.set_defaults(func=command_connect)
 
