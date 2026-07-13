@@ -1,0 +1,33 @@
+name: 基础检查
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: 安装依赖
+        run: python3 -m pip install pyserial
+
+      - name: 检查 Python 语法
+        run: |
+          python3 -m py_compile dji-baiwang-tool
+          python3 -m py_compile dji-qmi-network
+
+      - name: 检查帮助命令
+        run: |
+          python3 dji-baiwang-tool --help
+          python3 dji-qmi-network --help

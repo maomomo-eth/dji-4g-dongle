@@ -1,123 +1,119 @@
 # 安装与卸载
 
-本文介绍在 Debian、Ubuntu、Raspberry Pi OS 等 Linux 系统上安装、升级和卸载本项目。
+## 系统要求
 
-## 1. 系统要求
-
-已实机验证：
+已完成实机验证：
 
 - Ubuntu 24.04
-- DJI 百旺 QDC507
-- QMI Raw-IP
-- 中国电信 LTE，APN `ctnet`
 
-理论上可用于带有 `option`、`qmi_wwan`、`cdc_wdm` 驱动的 Debian 系发行版。
+以下系统可尝试使用，但当前未完整验证：
 
-## 2. 安装依赖
+- Ubuntu 22.04
+- Debian 12
+- Raspberry Pi OS
+
+工具依赖 Linux 的 `option`、`qmi_wwan`、`cdc_wdm` 驱动和 systemd-resolved 相关命令。其他发行版可能需要调整软件包名称或 DNS 管理方式。
+
+## 安装依赖
 
 ```bash
 sudo apt update
-sudo apt install -y \
+sudo apt install \
   python3 \
   python3-serial \
   libqmi-utils \
   usbutils \
   iproute2 \
-  curl
+  curl \
+  -y
 ```
 
-依赖用途：
+| 软件包 | 作用 |
+| --- | --- |
+| `python3` | 运行两个 Python 工具 |
+| `python3-serial` | 扫描和访问模块 AT 串口 |
+| `libqmi-utils` | 提供 `qmicli` 等 QMI 管理命令 |
+| `usbutils` | 提供 `lsusb`，检查 USB ID 和驱动布局 |
+| `iproute2` | 提供 `ip`，配置接口地址和路由 |
+| `curl` | 可选显示指定接口的公网出口地址 |
 
-- `python3`：运行两个工具。
-- `python3-serial`：通过 AT 串口读取和修改模块配置。
-- `libqmi-utils`：提供 `qmicli` 和 `qmi-network`。
-- `usbutils`：提供 `lsusb`。
-- `iproute2`：配置接口、地址和路由。
-- `curl`：可选，用于查询 4G 公网出口 IP。
-
-若系统未提供 `python3-serial`，可改用：
+可选安装 `picocom` 进行手工 AT 调试：
 
 ```bash
-python3 -m pip install pyserial
+sudo apt install picocom -y
 ```
 
-## 3. 获取源码
+`picocom` 不是一键联网的必需依赖，使用后应退出串口，避免占用 AT 端口。
 
-```bash
-git clone https://github.com/maomomo-eth/dji-4g-dongle.git
-cd dji-4g-dongle
-```
+## 安装工具
 
-## 4. 安装工具
+在仓库根目录执行：
 
 ```bash
 sudo install -m 0755 dji-baiwang-tool /usr/local/sbin/dji-baiwang-tool
 sudo install -m 0755 dji-qmi-network /usr/local/sbin/dji-qmi-network
 ```
 
-确认安装：
+## 验证安装
 
 ```bash
 dji-baiwang-tool --help
 dji-qmi-network --help
 ```
 
-两个工具的分工：
+若 shell 提示找不到命令，请确认 `/usr/local/sbin` 位于当前用户的 `PATH` 中，或使用完整路径执行。
 
-- `dji-baiwang-tool`：备份、VID/PID 转换、恢复、批量改装和硬件验证。
-- `dji-qmi-network`：QMI 诊断、联网、状态查看和断开。
+## 升级
 
-## 5. 升级
+在本地仓库中更新代码并重新安装：
 
 ```bash
-cd dji-4g-dongle
-git pull
+git pull --ff-only
+
 sudo install -m 0755 dji-baiwang-tool /usr/local/sbin/dji-baiwang-tool
 sudo install -m 0755 dji-qmi-network /usr/local/sbin/dji-qmi-network
 ```
 
-升级不会删除 `/var/lib/dji-baiwang-tool/backups` 中的备份。
+## 卸载
 
-## 6. 卸载
-
-先断开 QMI 数据连接：
+先正常断开当前 QMI 会话：
 
 ```bash
 sudo dji-qmi-network disconnect
 ```
 
-删除工具：
+删除已安装工具：
 
 ```bash
 sudo rm -f /usr/local/sbin/dji-baiwang-tool
 sudo rm -f /usr/local/sbin/dji-qmi-network
 ```
 
-可选：删除运行状态和备份：
+清理可能残留的运行状态：
 
 ```bash
 sudo rm -f /run/dji-qmi-network.json
+```
+
+`dji-baiwang-tool` 的默认备份目录是：
+
+```text
+/var/lib/dji-baiwang-tool/backups
+```
+
+卸载工具时不要默认删除这些备份。确认不再需要恢复任何模块后，才手动删除：
+
+```bash
 sudo rm -rf /var/lib/dji-baiwang-tool
 ```
 
-删除备份前请确认不再需要恢复模块原始配置。
+此命令会永久删除全部模块备份，执行前应另行保存需要保留的 JSON 文件。
 
-## 7. 恢复 ModemManager
+## 恢复 ModemManager
 
-`dji-qmi-network connect` 可能临时停止 `ModemManager`，正常执行 `disconnect` 时会自动恢复。
-
-若此前手动禁用了它，可执行：
+若排障时曾手动禁用 ModemManager，可重新启用并立即启动：
 
 ```bash
 sudo systemctl enable --now ModemManager
 ```
 
-检查状态：
-
-```bash
-systemctl status ModemManager
-```
-
-## 8. 权限说明
-
-涉及 USB 串口、QMI 控制设备、IP 地址、路由和 DNS 的操作均需要 root 权限，因此示例命令使用 `sudo`。

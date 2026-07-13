@@ -2,96 +2,98 @@
 
 ## 支持哪些模块？
 
-目前实机验证的是 DJI 百旺 QDC507，固件 `QDC507GLEFM21`。其他采用 Quectel QMI 接口、USB 功能布局相近的模块可能可用，但修改配置前必须自行备份和验证。
+当前仅实机验证 DJI 百旺 QDC507，固件为 `QDC507GLEFM21`。其他 QDC507 固件、模块批次及相近 Quectel 模块当前未验证，不能视为已支持。
 
 ## 支持哪些系统？
 
-已验证 Ubuntu 24.04。Debian、Raspberry Pi OS 等 Debian 系发行版通常也可使用，前提是内核包含 `option`、`qmi_wwan` 和 `cdc_wdm`。
+已验证 Ubuntu 24.04。Ubuntu 22.04、Debian 12 和 Raspberry Pi OS 可尝试，但当前未完整验证，可能需要调整驱动、软件包或 DNS 配置。
 
 ## 支持 Windows 吗？
 
-当前两个工具面向 Linux，依赖 Linux 驱动、`qmicli`、`iproute2` 和 `resolvectl`，不支持 Windows。
+当前未验证，也不支持直接运行。这两个工具依赖 Linux 设备节点、`qmicli`、`ip` 和 `resolvectl`。
 
 ## 支持 OpenWrt 吗？
 
-思路相同，但 OpenWrt 的网络管理、DNS、服务脚本与 Ubuntu 不同。当前 `dji-qmi-network` 不应直接用于 OpenWrt，后续可单独适配 `uqmi`、netifd 和 UCI。
+当前未验证。OpenWrt 通常使用 netifd、UCI 和不同的 QMI/DNS 工具链，`dji-qmi-network` 不能直接视为兼容。
 
-## 为什么要修改 VID/PID？
+## 支持树莓派吗？
 
-原始 `2CA3:4006` 不一定被通用 Linux 驱动自动识别。改为标准 Quectel `2C7C:0125` 后，常见内核可自动匹配 `option` 和 `qmi_wwan`。
+Raspberry Pi OS 当前未完整验证。若内核提供 `option`、`qmi_wwan` 和 `cdc_wdm`，基础改装工具可能可用；联网脚本仍可能因 DNS 和服务管理方式不同而需要适配。
 
-## 修改 VID/PID 会刷固件吗？
+## 为什么要改 VID/PID？
 
-不会。本项目只写入模块配置中的 USB ID，不刷写基带固件，也不主动改变已验证可用的 USB 功能布局。
+原始 `2CA3:4006` 在通用 Linux 环境中可能无法自动匹配所需驱动。改为标准 Quectel `2C7C:0125` 后，已验证环境可自动绑定 `option` 和 `qmi_wwan`。
 
-## 为什么必须先备份？
+## 修改 VID/PID 会不会改变固件？
 
-不同批次模块的 `usbcfg`、`usbnet` 或固件可能不同。备份可以按 IMEI 恢复原始配置，避免使用别人的配置覆盖自己的模块。
+不会刷写基带固件。`convert` 只写模块配置中的 `usbid`，不覆盖已经验证可用的完整 USB 功能布局。
 
-## 为什么一次只能连接一块模块？
+## 可以恢复吗？
 
-改装工具会自动扫描 AT 串口和目标 USB ID。多块相同模块同时连接时，端口与 IMEI 的对应关系容易混淆，存在改错设备的风险。
+可以。`restore` 默认按当前 IMEI 找到最新备份，并写回备份中的 `usbnet` 和完整 `usbcfg`。恢复能力依赖正确且完整的原始备份。
 
-## 为什么 `qmi-network` 已成功，但没有 IPv4？
+## 为什么要备份？
 
-`qmi-network` 主要建立 WDS 数据会话，不一定自动把 QMI 返回的 Raw-IP 参数配置到 Linux 接口。`dji-qmi-network connect` 会继续读取当前设置并配置 IP、路由、MTU 和 DNS。
+不同固件和模块批次的 USB 配置可能不同。备份保存当前模块的完整配置，既可恢复，也可防止误用其他模块的参数。
 
-## 是否需要 `udhcpc`？
+## 为什么不用 DHCP？
 
-不需要。QDC507 的实测链路使用 QMI Raw-IP，地址参数由 WDS 当前设置返回，不依赖 DHCP。
+实测 QMI Raw-IP 会话通过 WDS 当前设置直接返回 IPv4、掩码、网关、DNS 和 MTU。`dji-qmi-network` 读取这些参数并配置 Linux 接口，因此不依赖 `udhcpc`。
 
-## 为什么要停止 ModemManager？
+## 为什么公网 IP 会变化？
 
-ModemManager 可能先创建 QMI 客户端并抢占控制通道，导致手动运行 `qmicli` 时出现 CID 分配失败或 `endpoint hangup`。联网工具会按需自动停止，并在断开时恢复。
+移动网络通常动态分配承载地址，并可能使用运营商级 NAT。重新拨号、切换网络或运营商侧调整都可能改变公网出口。
 
-## 常见 APN 是什么？
+## 运营商分配的是公网 IP 吗？
 
-| 运营商 | 常见 APN |
-| --- | --- |
-| 中国移动 | `cmnet` |
-| 中国联通 | `3gnet` |
-| 中国电信 | `ctnet` |
+不一定。接口地址可能是公网地址，也可能是运营商内部私网地址。是否可从互联网直接访问还取决于 NAT、防火墙、套餐和运营商策略。
 
-物联网卡、专网卡和境外 SIM 必须使用运营商或卡商提供的 APN。
+## 为什么有时是私网地址？
 
-## 4G 得到的 `10.x.x.x` 是公网 IP 吗？
+运营商常通过 CGNAT 让多个用户共享公网出口，以节省 IPv4 地址。接口上的 `10.0.0.0/8`、`100.64.0.0/10` 等地址通常不能从公网直接入站访问。
 
-通常不是。它是运营商分配给模块的承载网地址，公网访问会经过运营商 NAT。使用 `curl --interface <接口> https://ifconfig.me` 看到的是公网出口 IP。
+## 可以长期插着使用吗？
 
-## 公网出口 IP 为什么会变化？
+长期稳定性当前未验证。持续运行需要额外关注 USB 供电、散热、信号、断线重拨和异常会话清理。
 
-移动网络通常使用动态地址和运营商级 NAT，重新拨号、切换基站或网络侧调整都可能改变出口 IP。
+## 可以作为备用网络吗？
 
-## 可以同时保留有线和 4G 吗？
-
-可以。通过路由 metric 控制优先级。较小值优先，例如 4G `50`、有线 `100` 时通常优先走 4G；把 4G 设置为 `500` 可作为备用路由。
-
-## 如何只测试 4G，不改变默认出口？
-
-连接时使用较大的 metric，并通过接口明确发起请求：
+可以通过较大的路由 metric 降低 4G 优先级，例如：
 
 ```bash
-sudo dji-qmi-network connect --apn ctnet --metric 1000
-ping -I wwp0s20f0u6i4 223.5.5.5
-curl --interface wwp0s20f0u6i4 https://ifconfig.me
+sudo dji-qmi-network connect --apn ctnet --metric 500
 ```
 
-## CID 和 PDH 是什么？
+自动故障切换和断线重拨当前未验证，工具只负责建立和管理本次连接。
 
-CID 是 QMI WDS 服务客户端 ID，PDH 是本次数据连接的 Packet Data Handle。断开时需要它们准确停止对应会话。
+## 可以同时使用有线、Wi-Fi 和 4G 吗？
 
-## 状态文件有什么用？
+可以保留多条连接，由路由 metric 和策略路由决定出口。默认 4G metric 为 `50`，数值越小通常优先级越高。
 
-`/run/dji-qmi-network.json` 保存本次连接的设备、接口、CID、PDH、地址、网关、DNS 和 ModemManager 状态，供 `status` 展示和 `disconnect` 精确清理。
+## 为什么 ModemManager 会冲突？
 
-## 重启后还需要手动连接吗？
+ModemManager 可能先打开 QMI 控制设备并持有客户端资源，手工 `qmicli` 随后可能出现 CID 分配失败或 `endpoint hangup`。联网工具会按需停止它，并在正常断开时恢复。
 
-当前版本不会自动开机拨号。可在确认脚本稳定后自行配置 systemd 服务；正式加入项目前还需要设计重试、断线重拨和有线网络回退策略。
+## 能否同时让 NetworkManager 管理？
 
-## 可以用模块做路由器吗？
+当前未验证，不建议让 NetworkManager/ModemManager 与本工具同时管理同一个 QMI 设备和接口。两边可能重复建立会话、改写地址、路由或 DNS。如需 NetworkManager 管理，应使用其移动宽带配置并停止本工具的会话。
 
-可以，但本项目目前只负责主机自身联网。要给其他设备共享网络，还需配置 IPv4 转发、NAT、防火墙和 DHCP/DNS 服务。
+## 一次能否改多块模块？
 
-## 如何安全提交问题？
+`batch` 可以连续处理多块，但不是同时处理。一次只连接一块，完成并拔出后再插下一块，每块均按 IMEI 单独备份。
 
-提供系统版本、模块固件、`lsusb -t`、`doctor` 和相关错误输出即可。请隐藏 IMEI、ICCID、手机号、账户信息和私有 APN 凭据。
+## `CID` 和 `PDH` 是什么？
+
+CID 是 QMI WDS 客户端 ID，PDH 是 Packet Data Handle。工具将两者保存在 `/run/dji-qmi-network.json`，用于准确停止对应的数据会话。
+
+## 状态文件可以长期保存吗？
+
+不应长期保存。`/run` 通常是易失目录，重启后文件会消失；其中的 CID/PDH 也只对应当前模块会话。正常断开会自动删除状态文件。
+
+## 可以自动开机连接或断线重拨吗？
+
+当前未验证，项目尚未提供 systemd 服务。生产使用前还需设计启动顺序、重试、健康检查、断线清理和其他网络回退策略。
+
+## 可以用模块给其他设备共享网络吗？
+
+当前项目只配置 Linux 主机自身联网。作为路由器还需要单独配置 IPv4 转发、NAT、防火墙以及局域网 DHCP/DNS；该场景当前未验证。

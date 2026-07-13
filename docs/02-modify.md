@@ -1,57 +1,45 @@
 # 模块改装
 
-本文介绍如何识别、备份、转换和恢复 DJI 百旺 QDC507 4G 模块。
+本文说明如何使用 `dji-baiwang-tool` 备份、转换、验证和恢复 DJI 百旺 QDC507。
 
-## 1. 改装目标
+## 改装目标
 
-原始模块使用 DJI/百旺 USB ID：
+将模块 USB ID 从：
 
 ```text
 2CA3:4006
 ```
 
-本项目将其 VID/PID 持久化改为标准 Quectel：
+修改为标准 Quectel：
 
 ```text
 2C7C:0125
 ```
 
-转换时只修改 `usbid`，不改动已经验证可用的 USB 功能布局。模块继续提供：
+`convert` 只修改 `usbid`，不改变已经验证可用的 USB 功能布局。工具仍会把完整 `usbcfg`、`usbnet` 和 `usbid` 写入备份，但只有执行恢复时才会写回完整 `usbnet` 和 `usbcfg`。
 
-- `option` 串口驱动
-- `qmi_wwan` 网络驱动
-- `/dev/cdc-wdm0` QMI 控制设备
-- `wwp*` / `wwan*` 网络接口
+改装时一次只连接一块模块，写入过程中不要断电。
 
-## 2. 改装前准备
-
-一次只连接一块模块，并确保已经安装工具：
+## 第一步：连接并查看状态
 
 ```bash
 sudo dji-baiwang-tool status
 ```
 
-典型输出：
+常见字段：
 
-```text
-AT 端口：/dev/ttyUSB2
-IMEI：863212060502298
-固件：QDC507GLEFM21
-USBID：2CA3:4006
-USBCFG：2CA3:4006, diag=1, nmea=1, at=1, modem=1, rmnet=1, adb=0, uac=0
-USBNET：0
-```
-
-字段说明：
-
-- `AT 端口`：可响应 AT 命令的串口。
-- `IMEI`：用于为每块模块匹配独立备份。
-- `固件`：当前模块固件版本。
+- `AT 端口`：自动扫描后找到的可响应 AT 命令的串口。
+- `IMEI`：模块唯一标识，用于匹配独立备份。
+- `固件`：模块当前固件版本。
 - `USBID`：当前持久化 VID/PID。
-- `USBCFG`：USB 功能布局。
-- `USBNET`：USB 网络模式，本项目实测为 QMI Raw-IP。
+- `USBCFG`：USB 串口和网络等功能布局。
+- `USBNET`：USB 网络模式配置。
 
-## 3. 先备份原始配置
+不同机器上的 AT 端口编号可能不同，不要预先写死为某个 `/dev/ttyUSB*`。
+
+## 第二步：备份
+
+推荐将备份放在仓库之外的持久目录：
 
 ```bash
 sudo dji-baiwang-tool \
@@ -59,25 +47,18 @@ sudo dji-baiwang-tool \
   backup
 ```
 
-备份文件示例：
+文件命名格式：
 
 ```text
-863212060502298-QDC507GLEFM21-20260713-143000.json
-863212060502298-latest.json
+IMEI-固件-时间.json
+IMEI-latest.json
 ```
 
-备份包含：
+`IMEI-latest.json` 指向或复制该 IMEI 的最新备份。备份包括完整 `usbcfg`、`usbnet`、`usbid` 和原始 AT 返回，应妥善保留。
 
-- IMEI
-- 固件版本
-- `usbcfg`
-- `usbnet`
-- `usbid`
-- 原始 AT 返回
+注意：在 `sudo` 环境中，`~` 的展开行为取决于 shell。若希望路径毫无歧义，可改用当前用户目录的绝对路径，例如 `$HOME/dev/dji/backups` 展开后的实际路径。
 
-不要跳过备份。恢复操作会按当前模块 IMEI 自动寻找对应备份。
-
-## 4. 转换 VID/PID
+## 第三步：转换 VID/PID
 
 ```bash
 sudo dji-baiwang-tool \
@@ -85,15 +66,9 @@ sudo dji-baiwang-tool \
   convert --yes
 ```
 
-工具会先再次备份，然后执行：
+`convert` 会再次自动备份，然后仅写入 `usbid`。不加 `--restart` 时，完成后需要断电重新拔插模块，让 USB 重新枚举。
 
-```text
-AT+QCFG="usbid",11388,293
-```
-
-十进制 `11388:293` 即十六进制 `2C7C:0125`。
-
-转换完成后，断电重新拔插模块。也可以让工具自动重启：
+可选自动重启模块：
 
 ```bash
 sudo dji-baiwang-tool \
@@ -101,73 +76,33 @@ sudo dji-baiwang-tool \
   convert --yes --restart
 ```
 
-执行 `--restart` 后串口断开和 USB 重新枚举属于正常现象。
+使用 `--restart` 后串口断开属于正常现象，等待设备重新枚举即可。
 
-## 5. 验证改装结果
-
-先查看 USB ID：
+## 第四步：验证
 
 ```bash
 lsusb
-```
-
-应能看到：
-
-```text
-ID 2c7c:0125 Quectel Wireless Solutions Co., Ltd.
-```
-
-检查驱动布局：
-
-```bash
 lsusb -t
-```
-
-目标布局应包含至少四个 `option` 接口和一个 `qmi_wwan` 接口，例如：
-
-```text
-If 0, Driver=option
-If 1, Driver=option
-If 2, Driver=option
-If 3, Driver=option
-If 4, Driver=qmi_wwan
-```
-
-运行完整验证：
-
-```bash
 sudo dji-baiwang-tool verify --require-standard
 ```
 
-需要查看完整 QMI 返回时：
+期望看到：
+
+- USB ID 为 `2C7C:0125`。
+- `option` 至少绑定 4 个接口。
+- `qmi_wwan` 至少绑定 1 个接口。
+- 出现 `/dev/cdc-wdm*` QMI 控制设备。
+- 出现 `wwp*`、`wwan*` 或 `wwx*` 网络接口。
+
+实际设备编号和网络接口名由内核及 USB 拓扑决定，不要写死。需要完整 QMI 返回时使用：
 
 ```bash
 sudo dji-baiwang-tool verify --require-standard --verbose
 ```
 
-## 6. 驱动和设备含义
+## 恢复
 
-### option
-
-负责模块的多个 USB 串口，常见用途包括诊断、NMEA、AT 命令和 Modem 端口。
-
-### qmi_wwan
-
-负责 QMI 数据网络接口，成功绑定后会创建 `wwp*`、`wwan*` 或 `wwx*` 接口。
-
-### cdc_wdm
-
-提供 QMI 控制设备，通常为：
-
-```text
-/dev/cdc-wdm0
-```
-
-`qmicli` 通过该设备查询 SIM、信号、驻网状态并建立 WDS 数据连接。
-
-## 7. 恢复原始配置
-
-按当前 IMEI 自动寻找最新备份：
+默认按当前模块 IMEI 查找最新备份：
 
 ```bash
 sudo dji-baiwang-tool \
@@ -175,22 +110,25 @@ sudo dji-baiwang-tool \
   restore --yes
 ```
 
-指定备份文件：
+也可以指定备份文件：
 
 ```bash
 sudo dji-baiwang-tool \
-  restore --file ~/dev/dji/backups/IMEI-latest.json --yes
+  restore \
+  --file /path/to/backup.json \
+  --yes
 ```
 
-恢复时会先写入备份中的 `usbnet`，再写入完整 `usbcfg`。完成后需要重新拔插，或者添加：
+恢复会先写回备份中的 `usbnet`，最后写回完整 `usbcfg`，因为后者可能触发 USB 重新枚举。
 
-```bash
---restart
-```
+- 默认按当前 IMEI 匹配备份。
+- 指定文件时仍会校验备份 IMEI。
+- 跨 IMEI 恢复必须添加 `--force`。
+- `--force` 可能把不兼容的完整 USB 配置写入另一块模块，不推荐普通用户使用。
 
-默认拒绝把其他 IMEI 的备份写入当前模块。确需跨模块恢复时可使用 `--force`，但风险较高。
+恢复后按提示重新拔插，或在命令末尾添加 `--restart`。
 
-## 8. 批量改装
+## 批量模式
 
 ```bash
 sudo dji-baiwang-tool \
@@ -198,21 +136,20 @@ sudo dji-baiwang-tool \
   batch --yes
 ```
 
-流程为：
+批量模式仍然是逐块处理：
 
-1. 等待插入一块模块。
-2. 自动读取 IMEI 和配置。
-3. 按 IMEI 保存备份。
-4. 写入 `2C7C:0125`。
-5. 提示拔出模块。
-6. 插入下一块继续。
+1. 一次只连接一块模块。
+2. 工具读取 IMEI 和当前配置并单独备份。
+3. 工具按需写入 `2C7C:0125`。
+4. 处理完成后拔出当前模块，再插入下一块。
 
-批量模式仍要求一次只连接一块模块。
+每块模块都按 IMEI 建立独立备份，不要交换备份文件。
 
-## 9. 风险提示
+## 安全限制
 
-- 修改前必须保存原始备份。
-- 写入过程中不要断电或拔出模块。
-- 不要随意修改未知的 `usbcfg` 功能位。
-- 本项目不刷写基带固件，只修改模块配置。
-- 未插 SIM 时出现 `no-atr-received` 通常属于正常现象。
+- 修改前必须备份，并确认备份文件可以读取。
+- 不要使用其他模块的完整 `usbcfg` 完成 VID/PID 修改。
+- 写入和重新枚举期间不要断电或拔出设备。
+- 本工具不刷写基带固件，但持久化 USB 配置仍有风险。
+- 当前仅实机验证 `QDC507GLEFM21`；其他固件和批次可能需要额外适配。
+
