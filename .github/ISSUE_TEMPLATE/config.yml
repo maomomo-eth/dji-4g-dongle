@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 项目仓库
+    url: https://github.com/maomomo-eth/dji-4g-dongle
+    about: 查看 README、使用文档和已有 Issue
+
