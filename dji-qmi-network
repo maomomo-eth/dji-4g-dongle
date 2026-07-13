@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""DJI 百旺 QDC507 QMI 联网管理工具。"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+STATE_FILE = Path("/run/dji-qmi-network.json")
+DEFAULT_APN = "ctnet"
+DEFAULT_METRIC = 50
+TEST_IP = "223.5.5.5"
+
+
+class ToolError(RuntimeError):
+    """用户可读错误。"""
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise ToolError("该命令需要 root 权限，请使用 sudo 运行。")
+
+
+def require_command(name: str) -> None:
+    if not shutil.which(name):
+        raise ToolError(f"缺少命令：{name}")
+
+
+def run_command(
+    command: list[str],
+    timeout: float = 20,
+    check: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=check,
+        )
+    except FileNotFoundError as exc:
+        raise ToolError(f"缺少命令：{command[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ToolError(f"命令执行超时：{' '.join(command)}") from exc
+
+
+def command_output(result: subprocess.CompletedProcess[str]) -> str:
+    return "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part.strip()
+    )
+
+
+def find_qmi_device(specified: str | None = None) -> str:
+    if specified:
+        if not Path(specified).exists():
+            raise ToolError(f"QMI 设备不存在：{specified}")
+        return specified
+
+    devices = sorted(glob.glob("/dev/cdc-wdm*"))
+    if not devices:
+        raise ToolError("未找到 /dev/cdc-wdm*，请确认 qmi_wwan 已加载。")
+    if len(devices) > 1:
+        raise ToolError("发现多个 QMI 设备，请使用 --device 指定。")
+    return devices[0]
+
+
+def find_interface(device: str, specified: str | None = None) -> str:
+    if specified:
+        if not Path(f"/sys/class/net/{specified}").exists():
+            raise ToolError(f"网络接口不存在：{specified}")
+        return specified
+
+    name = Path(device).name
+    candidates = sorted(glob.glob(f"/sys/class/usbmisc/{name}/device/net/*"))
+    if not candidates:
+        candidates = sorted(
+            path for path in glob.glob("/sys/class/net/*")
+            if Path(path).name.startswith(("wwan", "wwp", "wwx"))
+        )
+    if not candidates:
+        raise ToolError("未找到 QMI 网络接口。")
+    if len(candidates) > 1:
+        names = ", ".join(Path(path).name for path in candidates)
+        raise ToolError(f"发现多个 WWAN 接口（{names}），请使用 --interface 指定。")
+    return Path(candidates[0]).name
+
+
+def qmicli(device: str, arguments: list[str], timeout: float = 25) -> str:
+    result = run_command(["qmicli", "-d", device, *arguments], timeout=timeout)
+    output = command_output(result)
+    if result.returncode != 0:
+        raise ToolError(output or "qmicli 执行失败。")
+    return output
+
+
+def modemmanager_active() -> bool:
+    if not shutil.which("systemctl"):
+        return False
+    result = run_command(
+        ["systemctl", "is-active", "--quiet", "ModemManager"], timeout=5
+    )
+    return result.returncode == 0
+
+
+def stop_modemmanager() -> bool:
+    if not modemmanager_active():
+        return False
+    log("正在停止 ModemManager，避免占用 QMI 控制通道……")
+    result = run_command(["systemctl", "stop", "ModemManager"], timeout=15)
+    if result.returncode != 0:
+        raise ToolError(command_output(result) or "停止 ModemManager 失败。")
+    time.sleep(0.5)
+    return True
+
+
+def start_modemmanager() -> None:
+    if not shutil.which("systemctl"):
+        return
+    result = run_command(["systemctl", "start", "ModemManager"], timeout=15)
+    if result.returncode != 0:
+        log("警告：恢复 ModemManager 失败，请稍后手动启动。")
+
+
+def ensure_raw_ip(interface: str) -> None:
+    raw_ip = Path(f"/sys/class/net/{interface}/qmi/raw_ip")
+    if not raw_ip.exists():
+        raise ToolError(
+            f"接口 {interface} 没有 raw_ip 控制节点，可能不是 qmi_wwan 接口。"
+        )
+
+    current = raw_ip.read_text(encoding="utf-8").strip().upper()
+    if current == "Y":
+        return
+
+    log("正在启用 QMI Raw-IP 模式……")
+    run_command(["ip", "link", "set", interface, "down"], timeout=5)
+    raw_ip.write_text("Y\n", encoding="utf-8")
+    run_command(["ip", "link", "set", interface, "up"], timeout=5)
+
+    if raw_ip.read_text(encoding="utf-8").strip().upper() != "Y":
+        raise ToolError("Raw-IP 模式设置失败。")
+
+
+def parse_quoted(output: str, label: str) -> str | None:
+    match = re.search(rf"{re.escape(label)}:\s*'([^']+)'", output)
+    return match.group(1) if match else None
+
+
+def parse_network_started(output: str) -> tuple[int, int]:
+    pdh_match = re.search(r"Packet data handle:\s*'(\d+)'", output)
+    cid_match = re.search(r"CID:\s*'(\d+)'", output)
+    if not pdh_match or not cid_match:
+        raise ToolError(f"无法解析拨号结果：\n{output}")
+    return int(cid_match.group(1)), int(pdh_match.group(1))
+
+
+def parse_settings(output: str) -> dict[str, Any]:
+    fields = {
+        "address": r"IPv4 address:\s*([0-9.]+)",
+        "netmask": r"IPv4 subnet mask:\s*([0-9.]+)",
+        "gateway": r"IPv4 gateway address:\s*([0-9.]+)",
+        "dns1": r"IPv4 primary DNS:\s*([0-9.]+)",
+        "dns2": r"IPv4 secondary DNS:\s*([0-9.]+)",
+        "mtu": r"MTU:\s*(\d+)",
+    }
+    parsed: dict[str, Any] = {}
+    for key, pattern in fields.items():
+        match = re.search(pattern, output)
+        if match:
+            parsed[key] = match.group(1)
+
+    for required in ("address", "netmask", "gateway"):
+        if required not in parsed:
+            raise ToolError(f"运营商未返回完整 IPv4 参数：\n{output}")
+
+    parsed["prefix"] = ipaddress.IPv4Network(
+        f"0.0.0.0/{parsed['netmask']}"
+    ).prefixlen
+    parsed["mtu"] = int(parsed.get("mtu", 1500))
+    parsed["dns"] = [
+        value for value in (parsed.get("dns1"), parsed.get("dns2")) if value
+    ]
+    return parsed
+
+
+def wait_for_registration(device: str, timeout: int) -> str:
+    deadline = time.monotonic() + timeout
+    last_output = ""
+    while time.monotonic() < deadline:
+        last_output = qmicli(device, ["--nas-get-serving-system"])
+        if (
+            "Registration state: 'registered'" in last_output
+            and "PS: 'attached'" in last_output
+        ):
+            return last_output
+        time.sleep(2)
+    raise ToolError(f"等待 LTE 注册超时：\n{last_output}")
+
+
+def configure_interface(
+    interface: str,
+    settings: dict[str, Any],
+    metric: int,
+) -> None:
+    address = str(settings["address"])
+    prefix = str(settings["prefix"])
+    gateway = str(settings["gateway"])
+    mtu = str(settings["mtu"])
+
+    run_command(["ip", "link", "set", interface, "up"], timeout=5, check=True)
+    run_command(
+        ["ip", "link", "set", interface, "mtu", mtu], timeout=5, check=True
+    )
+    run_command(
+        ["ip", "addr", "flush", "dev", interface, "scope", "global"], timeout=5
+    )
+    run_command(
+        ["ip", "addr", "add", f"{address}/{prefix}", "dev", interface],
+        timeout=5,
+        check=True,
+    )
+    run_command(
+        ["ip", "route", "replace", gateway, "dev", interface],
+        timeout=5,
+        check=True,
+    )
+    run_command(
+        [
+            "ip", "route", "replace", "default", "via", gateway,
+            "dev", interface, "metric", str(metric),
+        ],
+        timeout=5,
+        check=True,
+    )
+
+
+def configure_dns(interface: str, dns: list[str]) -> bool:
+    if not dns or not shutil.which("resolvectl"):
+        return False
+    result = run_command(["resolvectl", "dns", interface, *dns], timeout=5)
+    if result.returncode != 0:
+        return False
+    result = run_command(["resolvectl", "domain", interface, "~."], timeout=5)
+    return result.returncode == 0
+
+
+def save_state(state: dict[str, Any]) -> None:
+    STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.chmod(STATE_FILE, 0o600)
+
+
+def load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        raise ToolError(f"没有找到联网状态文件：{STATE_FILE}")
+    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+
+
+def test_connection(interface: str) -> tuple[bool, str | None]:
+    ping = run_command(
+        ["ping", "-I", interface, "-c", "2", "-W", "3", TEST_IP], timeout=10
+    )
+    ok = ping.returncode == 0
+    public_ip: str | None = None
+    if ok and shutil.which("curl"):
+        curl = run_command(
+            [
+                "curl", "--interface", interface, "--max-time", "10", "-fsS",
+                "https://ifconfig.me",
+            ],
+            timeout=15,
+        )
+        if curl.returncode == 0:
+            public_ip = curl.stdout.strip() or None
+    return ok, public_ip
+
+
+def command_doctor(args: argparse.Namespace) -> None:
+    failures = 0
+    for command in ("qmicli", "ip"):
+        present = shutil.which(command) is not None
+        print(
+            f"{'✓' if present else '✗'} 命令 {command:<10} "
+            f"{'已安装' if present else '缺失'}"
+        )
+        failures += 0 if present else 1
+
+    try:
+        device = find_qmi_device(args.device)
+        print(f"✓ QMI 设备       {device}")
+    except ToolError as exc:
+        print(f"✗ QMI 设备       {exc}")
+        failures += 1
+        device = ""
+
+    if device:
+        try:
+            interface = find_interface(device, args.interface)
+            print(f"✓ 网络接口       {interface}")
+            raw_path = Path(f"/sys/class/net/{interface}/qmi/raw_ip")
+            raw = (
+                raw_path.read_text(encoding="utf-8").strip()
+                if raw_path.exists() else "不存在"
+            )
+            print(f"{'✓' if raw == 'Y' else '!'} Raw-IP         {raw}")
+        except ToolError as exc:
+            print(f"✗ 网络接口       {exc}")
+            failures += 1
+
+        try:
+            model = qmicli(device, ["--dms-get-model"])
+            print(f"✓ QMI 通信       {parse_quoted(model, 'Model') or '正常'}")
+        except ToolError as exc:
+            print(f"✗ QMI 通信       {exc}")
+            failures += 1
+
+        try:
+            sim = qmicli(device, ["--uim-get-card-status"])
+            ready = (
+                "Card state: 'present'" in sim
+                and "Application state: 'ready'" in sim
+            )
+            print(f"{'✓' if ready else '✗'} SIM 卡         {'已就绪' if ready else '未就绪'}")
+            failures += 0 if ready else 1
+        except ToolError as exc:
+            print(f"✗ SIM 卡         {exc}")
+            failures += 1
+
+        try:
+            serving = qmicli(device, ["--nas-get-serving-system"])
+            registered = "Registration state: 'registered'" in serving
+            attached = "PS: 'attached'" in serving
+            print(
+                f"{'✓' if registered and attached else '!'} LTE 网络       "
+                f"registered={registered}, attached={attached}"
+            )
+        except ToolError as exc:
+            print(f"! LTE 网络       {exc}")
+
+    mm = modemmanager_active()
+    print(
+        f"{'!' if mm else '✓'} ModemManager   "
+        f"{'正在运行，连接时会自动停止' if mm else '未占用'}"
+    )
+
+    if failures:
+        raise ToolError(f"诊断完成，发现 {failures} 个关键问题。")
+    print("诊断完成：关键项目正常。")
+
+
+def command_connect(args: argparse.Namespace) -> None:
+    require_root()
+    require_command("qmicli")
+    require_command("ip")
+
+    if STATE_FILE.exists() and not args.force:
+        raise ToolError("检测到已有联网状态。请先 disconnect，或添加 --force 覆盖。")
+
+    device = find_qmi_device(args.device)
+    interface = find_interface(device, args.interface)
+    mm_stopped = False
+    cid: int | None = None
+    pdh: int | None = None
+
+    try:
+        if modemmanager_active():
+            if args.keep_modemmanager:
+                raise ToolError(
+                    "ModemManager 正在运行，可能抢占 QMI。"
+                    "请去掉 --keep-modemmanager。"
+                )
+            mm_stopped = stop_modemmanager()
+
+        ensure_raw_ip(interface)
+        qmicli(device, ["--uim-get-card-status"])
+        serving = wait_for_registration(device, args.register_timeout)
+
+        plmn = parse_quoted(serving, "Description") or "未知运营商"
+        log(f"已注册 LTE 网络：{plmn}")
+        log(f"正在使用 APN {args.apn} 建立数据连接……")
+
+        started = qmicli(
+            device,
+            [
+                f"--wds-start-network=apn='{args.apn}',ip-type=4",
+                "--client-no-release-cid",
+            ],
+            timeout=45,
+        )
+        cid, pdh = parse_network_started(started)
+
+        settings_output = qmicli(
+            device,
+            [
+                f"--client-cid={cid}",
+                "--client-no-release-cid",
+                "--wds-get-current-settings",
+            ],
+        )
+        settings = parse_settings(settings_output)
+        configure_interface(interface, settings, args.metric)
+        dns_configured = configure_dns(interface, settings["dns"])
+
+        state = {
+            "device": device,
+            "interface": interface,
+            "apn": args.apn,
+            "cid": cid,
+            "pdh": pdh,
+            "metric": args.metric,
+            "settings": settings,
+            "dns_configured": dns_configured,
+            "modemmanager_stopped": mm_stopped,
+        }
+        save_state(state)
+
+        ok, public_ip = (
+            (True, None) if args.no_test else test_connection(interface)
+        )
+        print()
+        print("QMI 联网成功：")
+        print(f"  设备：      {device}")
+        print(f"  接口：      {interface}")
+        print(f"  APN：       {args.apn}")
+        print(f"  IPv4：      {settings['address']}/{settings['prefix']}")
+        print(f"  网关：      {settings['gateway']}")
+        print(
+            f"  DNS：       "
+            f"{', '.join(settings['dns']) if settings['dns'] else '未配置'}"
+        )
+        print(f"  路由 metric：{args.metric}")
+        print(f"  连通性：    {'正常' if ok else '失败'}")
+        if public_ip:
+            print(f"  公网出口：  {public_ip}")
+        if not ok:
+            raise ToolError("拨号和地址配置已完成，但公网连通性测试失败。")
+
+    except Exception:
+        if cid is not None and pdh is not None:
+            try:
+                qmicli(
+                    device,
+                    [
+                        f"--client-cid={cid}",
+                        "--client-no-release-cid",
+                        f"--wds-stop-network={pdh}",
+                    ],
+                )
+            except Exception:
+                pass
+        if mm_stopped:
+            start_modemmanager()
+        raise
+
+
+def command_disconnect(args: argparse.Namespace) -> None:
+    require_root()
+    require_command("qmicli")
+    require_command("ip")
+    state = load_state()
+
+    device = str(state["device"])
+    interface = str(state["interface"])
+    cid = int(state["cid"])
+    pdh = int(state["pdh"])
+    settings = state.get("settings", {})
+
+    try:
+        qmicli(
+            device,
+            [
+                f"--client-cid={cid}",
+                "--client-no-release-cid",
+                f"--wds-stop-network={pdh}",
+            ],
+        )
+        log("QMI 数据连接已断开。")
+    except ToolError as exc:
+        log(f"警告：停止 QMI 会话失败：{exc}")
+
+    gateway = settings.get("gateway")
+    metric = state.get("metric", DEFAULT_METRIC)
+    if gateway:
+        run_command(
+            [
+                "ip", "route", "del", "default", "via", str(gateway),
+                "dev", interface, "metric", str(metric),
+            ],
+            timeout=5,
+        )
+        run_command(
+            ["ip", "route", "del", str(gateway), "dev", interface], timeout=5
+        )
+    run_command(
+        ["ip", "addr", "flush", "dev", interface, "scope", "global"], timeout=5
+    )
+
+    if state.get("dns_configured") and shutil.which("resolvectl"):
+        run_command(["resolvectl", "revert", interface], timeout=5)
+
+    try:
+        STATE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+    if state.get("modemmanager_stopped") and not args.no_restore_modemmanager:
+        log("正在恢复 ModemManager……")
+        start_modemmanager()
+
+    print("网络配置已清理。")
+
+
+def command_status(args: argparse.Namespace) -> None:
+    state: dict[str, Any] | None = None
+    if STATE_FILE.exists():
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+
+    device = find_qmi_device(args.device)
+    interface = find_interface(device, args.interface)
+    print(f"QMI 设备：{device}")
+    print(f"网络接口：{interface}")
+    print(f"ModemManager：{'运行中' if modemmanager_active() else '未运行'}")
+
+    serving = qmicli(device, ["--nas-get-serving-system"])
+    registered = "Registration state: 'registered'" in serving
+    print(f"网络注册：{'已注册' if registered else '未注册'}")
+    attached = "PS: 'attached'" in serving
+    print(f"数据附着：{'已附着' if attached else '未附着'}")
+
+    result = run_command(
+        ["ip", "-4", "addr", "show", "dev", interface], timeout=5
+    )
+    address_match = re.search(r"\binet\s+([^\s]+)", result.stdout)
+    print(f"IPv4 地址：{address_match.group(1) if address_match else '未配置'}")
+
+    if state:
+        print(f"状态文件：{STATE_FILE}")
+        print(f"APN：{state.get('apn', '未知')}")
+        print(f"CID/PDH：{state.get('cid')}/{state.get('pdh')}")
+    else:
+        print("状态文件：不存在")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="DJI 百旺 QDC507 QMI 联网管理工具")
+    parser.add_argument("--device", help="指定 QMI 设备，例如 /dev/cdc-wdm0")
+    parser.add_argument(
+        "--interface", help="指定网络接口，例如 wwp0s20f0u6i4"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    doctor = subparsers.add_parser("doctor", help="诊断驱动、SIM、驻网和冲突")
+    doctor.set_defaults(func=command_doctor)
+
+    connect = subparsers.add_parser(
+        "connect", help="一键拨号并配置 IP、路由和 DNS"
+    )
+    connect.add_argument(
+        "--apn", default=DEFAULT_APN, help=f"APN，默认：{DEFAULT_APN}"
+    )
+    connect.add_argument(
+        "--metric",
+        type=int,
+        default=DEFAULT_METRIC,
+        help=f"默认路由 metric，默认：{DEFAULT_METRIC}",
+    )
+    connect.add_argument(
+        "--register-timeout",
+        type=int,
+        default=60,
+        help="等待 LTE 注册秒数，默认：60",
+    )
+    connect.add_argument(
+        "--keep-modemmanager",
+        action="store_true",
+        help="不停止 ModemManager（不推荐）",
+    )
+    connect.add_argument(
+        "--no-test", action="store_true", help="跳过 ping 和公网 IP 测试"
+    )
+    connect.add_argument(
+        "--force", action="store_true", help="忽略已有状态文件并重新连接"
+    )
+    connect.set_defaults(func=command_connect)
+
+    disconnect = subparsers.add_parser(
+        "disconnect", help="断开 QMI 并清理网络配置"
+    )
+    disconnect.add_argument(
+        "--no-restore-modemmanager",
+        action="store_true",
+        help="断开后不恢复 ModemManager",
+    )
+    disconnect.set_defaults(func=command_disconnect)
+
+    status = subparsers.add_parser("status", help="查看 QMI、驻网和接口状态")
+    status.set_defaults(func=command_status)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        args.func(args)
+        return 0
+    except ToolError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+    except PermissionError as exc:
+        print(f"权限不足：{exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n操作已取消。", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
